@@ -1,0 +1,19 @@
+# Service account key files (never commit)
+keys/*
+!keys/.gitkeep
+
+# Python
+.venv
+venv
+__pycache__
+*.py[cod]
+*.so
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea
+.vscode
+.DS_Store
+*.sw?
