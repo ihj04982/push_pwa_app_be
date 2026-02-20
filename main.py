@@ -2,7 +2,10 @@
 Push PWA Backend: receives notification content from frontend, reads FCM tokens
 from Firestore, and sends push via FCM to those devices.
 """
+import logging
 import os
+import time
+from collections import defaultdict
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -12,9 +15,12 @@ load_dotenv(dotenv_path=os.path.join(_BASE_DIR, ".env"))
 
 import firebase_admin
 from firebase_admin import credentials, firestore, messaging
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -27,6 +33,26 @@ CORS_ORIGINS = [
 ]
 FCM_TOKENS_COLLECTION = "fcmTokens"
 MAX_TOKENS_PER_REQUEST = 100
+
+# Optional API key: if PUSH_API_KEY is set, requests to /api/send-push must send X-API-Key header.
+PUSH_API_KEY = (os.environ.get("PUSH_API_KEY") or "").strip()
+
+# Simple in-memory rate limit: max 30 send-push requests per minute per client IP.
+RATE_LIMIT_REQUESTS = 30
+RATE_LIMIT_WINDOW_SEC = 60
+_rate_limit_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _rate_limit_check(client_ip: str) -> bool:
+    """Return True if request is allowed, False if over limit."""
+    now = time.monotonic()
+    bucket = _rate_limit_buckets[client_ip]
+    bucket[:] = [t for t in bucket if now - t < RATE_LIMIT_WINDOW_SEC]
+    if len(bucket) >= RATE_LIMIT_REQUESTS:
+        return False
+    bucket.append(now)
+    return True
+
 
 app = FastAPI(title="Push PWA Backend")
 app.add_middleware(
@@ -121,14 +147,15 @@ def _send_messages_to_tokens(tokens: list[str], title: str, body: str) -> tuple[
                 )
             )
             success += 1
-        except Exception:
+        except Exception as e:
             failure += 1
+            logger.warning("FCM send failed for token %s...: %s", token[:16] if token else "", e)
     return success, failure
 
 
 class SendPushRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=200, description="알림 제목")
-    body: str = Field(..., max_length=1000, description="알림 본문")
+    body: str = Field(..., min_length=1, max_length=1000, description="알림 본문")
     device_name: Optional[str] = Field(
         default=None,
         max_length=100,
@@ -152,7 +179,18 @@ def health():
 
 
 @app.post("/api/send-push", response_model=SendPushResponse)
-def send_push(req: SendPushRequest) -> SendPushResponse:
+def send_push(request: Request, req: SendPushRequest):
+    client_ip = request.client.host if request.client else "unknown"
+    if not _rate_limit_check(client_ip):
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Too many requests. Try again later."},
+        )
+    if PUSH_API_KEY and request.headers.get("X-API-Key") != PUSH_API_KEY:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Invalid or missing API key."},
+        )
     _get_firebase_app()
     db = firestore.client()
     tokens = _collect_fcm_tokens(db, req.device_name)
